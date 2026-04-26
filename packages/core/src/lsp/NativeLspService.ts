@@ -83,6 +83,7 @@ export class NativeLspService {
   private normalizer: LspResponseNormalizer;
   private openedDocuments = new Map<string, Set<string>>();
   private lastConnections = new Map<string, LspConnectionInterface>();
+  private publishedDiagnostics = new Map<string, LspDiagnostic[]>();
 
   constructor(
     config: CoreConfig,
@@ -155,6 +156,55 @@ export class NativeLspService {
    */
   async start(): Promise<void> {
     await this.serverManager.startAll();
+    this.registerNotificationHandlers();
+  }
+
+  /**
+   * Register notification handlers on all ready server connections to capture
+   * push-based diagnostics (textDocument/publishDiagnostics).
+   */
+  private registerNotificationHandlers(): void {
+    for (const [serverName, handle] of Array.from(
+      this.serverManager.getHandles(),
+    )) {
+      if (handle.status !== 'READY' || !handle.connection) {
+        continue;
+      }
+      handle.connection.onNotification((notification) => {
+        if (notification.method === 'textDocument/publishDiagnostics') {
+          this.handlePublishDiagnostics(
+            serverName,
+            notification.params as Record<string, unknown>,
+          );
+        }
+      });
+    }
+  }
+
+  /**
+   * Handle textDocument/publishDiagnostics notification from an LSP server.
+   * Caches diagnostics keyed by document URI for later retrieval.
+   */
+  private handlePublishDiagnostics(
+    serverName: string,
+    params: Record<string, unknown>,
+  ): void {
+    const uri = params['uri'];
+    if (typeof uri !== 'string') {
+      return;
+    }
+    const items = params['diagnostics'];
+    if (!Array.isArray(items)) {
+      return;
+    }
+    const diagnostics: LspDiagnostic[] = [];
+    for (const item of items) {
+      const normalized = this.normalizer.normalizeDiagnostic(item, serverName);
+      if (normalized) {
+        diagnostics.push(normalized);
+      }
+    }
+    this.publishedDiagnostics.set(uri, diagnostics);
   }
 
   /**
@@ -172,16 +222,25 @@ export class NativeLspService {
   }
 
   /**
-   * Get ready server handles filtered by optional server name.
+   * Get ready server handles filtered by optional server name and/or file URI.
    * Each handle is guaranteed to have a valid connection.
    *
+   * When a fileUri is provided, servers are filtered to only those that
+   * declare support for the file's extension (via languages or extensionToLanguage).
+   * If no server explicitly matches the file, all ready servers are returned
+   * as a fallback.
+   *
    * @param serverName - Optional server name to filter by
+   * @param fileUri - Optional file URI to filter by language/extension support
    * @returns Array of [serverName, handle] tuples with active connections
    */
   private getReadyHandles(
     serverName?: string,
+    fileUri?: string,
   ): Array<[string, LspServerHandle & { connection: LspConnectionInterface }]> {
-    return Array.from(this.serverManager.getHandles().entries()).filter(
+    const allReady = Array.from(
+      this.serverManager.getHandles().entries(),
+    ).filter(
       (
         entry,
       ): entry is [
@@ -192,6 +251,76 @@ export class NativeLspService {
         entry[1].connection !== undefined &&
         (!serverName || entry[0] === serverName),
     );
+
+    if (!fileUri || serverName) {
+      return allReady;
+    }
+
+    const ext = this.extractExtension(fileUri);
+    if (!ext) {
+      return allReady;
+    }
+
+    const matching = allReady.filter(([, handle]) =>
+      this.serverSupportsExtension(handle, ext),
+    );
+
+    // Only return servers that explicitly declare support for the file extension.
+    // Falling back to all servers would send files to wrong servers (e.g. QML to clangd).
+    return matching;
+  }
+
+  /**
+   * Check whether a server declares support for a given file extension.
+   * A server matches if:
+   *   1. Its extensionToLanguage mapping contains the extension, OR
+   *   2. Its languages list contains a language ID that maps to the extension
+   *      (via LANGUAGE_ID_TO_EXTENSIONS or direct match)
+   */
+  private serverSupportsExtension(
+    handle: LspServerHandle,
+    ext: string,
+  ): boolean {
+    const lowerExt = ext.toLowerCase();
+
+    // Check extensionToLanguage mapping
+    const extMapping = handle.config.extensionToLanguage;
+    if (extMapping) {
+      if (extMapping[lowerExt] || extMapping['.' + lowerExt]) {
+        return true;
+      }
+    }
+
+    // Check if any declared language maps to this extension
+    for (const language of handle.config.languages) {
+      const mapped = LANGUAGE_ID_TO_EXTENSIONS[language];
+      if (mapped) {
+        if (mapped.includes(lowerExt)) {
+          return true;
+        }
+      } else if (language.toLowerCase() === lowerExt) {
+        // Language ID itself matches the extension (e.g. "cpp" -> .cpp)
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Extract the file extension (without dot) from a URI or file path.
+   */
+  private extractExtension(uri: string): string | undefined {
+    let filePath = uri;
+    if (uri.startsWith('file://')) {
+      try {
+        filePath = fileURLToPath(uri);
+      } catch {
+        return undefined;
+      }
+    }
+    const ext = path.extname(filePath);
+    return ext ? ext.slice(1).toLowerCase() : undefined;
   }
 
   /**
@@ -529,7 +658,7 @@ export class NativeLspService {
     serverName?: string,
     limit = 50,
   ): Promise<LspDefinition[]> {
-    const handles = this.getReadyHandles(serverName);
+    const handles = this.getReadyHandles(serverName, location.uri);
     const requestParams = {
       textDocument: { uri: location.uri },
       position: location.range.start,
@@ -598,7 +727,7 @@ export class NativeLspService {
     includeDeclaration = false,
     limit = 200,
   ): Promise<LspReference[]> {
-    const handles = this.getReadyHandles(serverName);
+    const handles = this.getReadyHandles(serverName, location.uri);
     const requestParams = {
       textDocument: { uri: location.uri },
       position: location.range.start,
@@ -664,7 +793,7 @@ export class NativeLspService {
     location: LspLocation,
     serverName?: string,
   ): Promise<LspHoverResult | null> {
-    const handles = this.getReadyHandles(serverName);
+    const handles = this.getReadyHandles(serverName, location.uri);
     const requestParams = {
       textDocument: { uri: location.uri },
       position: location.range.start,
@@ -715,7 +844,7 @@ export class NativeLspService {
     serverName?: string,
     limit = 200,
   ): Promise<LspSymbolInformation[]> {
-    const handles = this.getReadyHandles(serverName);
+    const handles = this.getReadyHandles(serverName, uri);
     const requestParams = { textDocument: { uri } };
 
     for (const [name, handle] of handles) {
@@ -791,7 +920,7 @@ export class NativeLspService {
     serverName?: string,
     limit = 50,
   ): Promise<LspDefinition[]> {
-    const handles = this.getReadyHandles(serverName);
+    const handles = this.getReadyHandles(serverName, location.uri);
     const requestParams = {
       textDocument: { uri: location.uri },
       position: location.range.start,
@@ -862,7 +991,7 @@ export class NativeLspService {
     serverName?: string,
     limit = 50,
   ): Promise<LspCallHierarchyItem[]> {
-    const handles = this.getReadyHandles(serverName);
+    const handles = this.getReadyHandles(serverName, location.uri);
     const requestParams = {
       textDocument: { uri: location.uri },
       position: location.range.start,
@@ -1026,7 +1155,7 @@ export class NativeLspService {
     uri: string,
     serverName?: string,
   ): Promise<LspDiagnostic[]> {
-    const handles = this.getReadyHandles(serverName);
+    const handles = this.getReadyHandles(serverName, uri);
     const allDiagnostics: LspDiagnostic[] = [];
 
     for (const [name, handle] of handles) {
@@ -1058,12 +1187,23 @@ export class NativeLspService {
           }
         }
       } catch (error) {
-        // Fall back to cached diagnostics from publishDiagnostics notifications
-        // This is handled by the notification handler if implemented
+        // Pull diagnostics not supported; fall back to cached push diagnostics
         debugLogger.warn(
-          `LSP textDocument/diagnostic failed for ${name}:`,
+          `LSP textDocument/diagnostic failed for ${name}, using cached diagnostics`,
           error,
         );
+      }
+    }
+
+    // Fall back to cached diagnostics from textDocument/publishDiagnostics.
+    // Wait for the server to push diagnostics if none were obtained via pull.
+    if (allDiagnostics.length === 0 && handles.length > 0) {
+      if (!this.publishedDiagnostics.has(uri)) {
+        await this.delay(DEFAULT_LSP_DOCUMENT_RETRY_DELAY_MS);
+      }
+      const cached = this.publishedDiagnostics.get(uri);
+      if (cached && cached.length > 0) {
+        return cached;
       }
     }
 
@@ -1132,7 +1272,7 @@ export class NativeLspService {
     serverName?: string,
     limit = 20,
   ): Promise<LspCodeAction[]> {
-    const handles = this.getReadyHandles(serverName);
+    const handles = this.getReadyHandles(serverName, uri);
 
     for (const [name, handle] of handles) {
       try {
